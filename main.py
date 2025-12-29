@@ -6,6 +6,7 @@ import io
 import os
 import sqlite3
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -19,6 +20,10 @@ from pydantic import BaseModel
 API_KEY = os.getenv("AI_SERVICE_KEY", "")
 ALLOWED_ORIGINS = os.getenv("AI_CORS_ORIGINS", "*").split(",")
 DEFAULT_CREDITS = int(os.getenv("AI_DEFAULT_CREDITS", "1"))
+
+logger = logging.getLogger("ai_service")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="EcoSync AI Service", version="0.1.0")
 app.add_middleware(
@@ -145,7 +150,9 @@ def _get_mobilenet_model():
 
         model = hub.load("https://tfhub.dev/google/tf2-preview/mobilenet_v2/feature_vector/4")
         _mobilenet_model = (model, tf)
-    except Exception:
+        logger.info("Loaded MobileNetV2 feature extractor from TF Hub")
+    except Exception as exc:
+        logger.exception("Failed to load MobileNetV2 model from TF Hub: %s", exc)
         _mobilenet_model = None
     _mobilenet_loaded = True
     return _mobilenet_model
@@ -154,6 +161,7 @@ def _get_mobilenet_model():
 def mobilenet_embed(img: Image.Image) -> Optional[np.ndarray]:
     pair = _get_mobilenet_model()
     if not pair:
+        logger.warning("MobileNet model unavailable; skipping embedding")
         return None
     model, tf = pair
     try:
@@ -164,6 +172,7 @@ def mobilenet_embed(img: Image.Image) -> Optional[np.ndarray]:
         vec = embedding.numpy().flatten()
         return vec
     except Exception:
+        logger.exception("MobileNet embedding failed")
         return None
 
 
@@ -180,6 +189,8 @@ async def verify(payload: VerifyPayload, x_ai_key: Optional[str] = Header(defaul
     post_id = payload.post_id
     media_b64 = payload.media_base64
 
+    logger.info("Verify start user=%s post=%s b64_len=%s", user_id, post_id, len(media_b64 or ""))
+
     # Perceptual hash as lightweight duplicate signal
     try:
         img = _decode_image(media_b64)
@@ -192,18 +203,22 @@ async def verify(payload: VerifyPayload, x_ai_key: Optional[str] = Header(defaul
     mn_vec = mobilenet_embed(img)
 
     if mn_vec is not None:
-        dup = search_vectors(user_id, mn_vec, "mobilenet", thresh=0.90)
+        logger.info("MobileNet embedding shape=%s norm=%.4f", mn_vec.shape, float(np.linalg.norm(mn_vec)))
+        dup = search_vectors(user_id, mn_vec, "mobilenet", thresh=0.80)
         save_vector(user_id, post_id, "mobilenet", mn_vec)
         if dup:
+            logger.info("Duplicate detected for post %s vs %s score=%.3f", post_id, dup["post_id"], dup["score"])
             return {
                 "status": "pending",
                 "notes": f"Duplicate detected (mobilenet) similar to {dup['post_id']} (score {dup['score']:.3f})",
                 "credits_awarded": 0,
             }
+        logger.info("Unique upload for post %s; marking verified", post_id)
         return {
             "status": "verified",
             "notes": "Unique upload (mobilenet)",
             "credits_awarded": DEFAULT_CREDITS,
         }
 
+    logger.warning("No MobileNet embedding produced for post %s; returning pending", post_id)
     return {"status": "pending", "notes": "Pending manual review", "credits_awarded": 0}
